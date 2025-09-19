@@ -1,1 +1,5 @@
 [# OneDateCreateChecker](https://uni928.github.io/OneDateCreateChecker/)
+
+特定の日付に編集したファイルを調べる事ができます。
+
+最終更新日がその日のファイルしか調べる事が出来ないため、そのファイルをその日以降も編集している場合は一覧に載りません。ご容赦下さい。
