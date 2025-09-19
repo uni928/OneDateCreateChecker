@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>フォルダ内ファイル一覧（更新日降順）</title>
+  <style>
+    :root { --bg:#0b1020; --card:#121834; --ink:#e9ecff; --muted:#b7c0ff; --accent:#7aa2ff; }
+    html,body{height:100%}
+    body{margin:0;background:linear-gradient(180deg, var(--bg), #0e1430);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Hiragino Kaku Gothic ProN","Yu Gothic UI","Yu Gothic","Meiryo",sans-serif}
+    header{position:sticky;top:0;z-index:10;background:rgba(11,16,32,.7);backdrop-filter: blur(6px);border-bottom:1px solid rgba(255,255,255,.08)}
+    .wrap{max-width:1100px;margin:0 auto;padding:16px}
+    h1{margin:0 0 6px;font-size:20px}
+    .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    button,.btn{appearance:none;border:1px solid rgba(255,255,255,.15);background:#1b2550;color:var(--ink);padding:10px 14px;border-radius:14px;cursor:pointer;transition:.15s ease;box-shadow:0 1px 0 rgba(255,255,255,.07) inset}
+    button:hover{transform:translateY(-1px);box-shadow:0 6px 14px rgba(0,0,0,.25)}
+    .secondary{background:#162149}
+    input[type="file"]{display:none}
+    .tip{color:var(--muted);font-size:13px}
+    #result{padding:20px}
+    .date-head{margin:26px 0 10px;padding-top:6px;border-top:1px dashed rgba(255,255,255,.12);color:#d2d9ff;font-weight:700;letter-spacing:.02em}
+    .file{display:grid;grid-template-columns:1fr auto;gap:8px 14px;align-items:center;padding:12px 14px;border-radius:16px;background:var(--card);box-shadow:0 3px 14px rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.06);margin:8px 0}
+    .meta{font-size:12px;color:var(--muted)}
+    .name{word-break:break-all}
+    .btns{display:flex;gap:8px}
+    .badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.15);color:#cfe2ff}
+    .footer{color:var(--muted);font-size:12px;margin-top:24px}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>フォルダ内ファイル一覧（更新日降順・サブフォルダ対応）</h1>
+      <div class="bar">
+        <button id="pickDir">フォルダを選ぶ（推奨・File System Access API）</button>
+        <label class="btn secondary" for="folderInput">または… フォルダを選ぶ（互換モード）</label>
+        <input id="folderInput" type="file" webkitdirectory directory multiple />
+        <span class="tip">※ Chrome / Edge などでは左のボタンが便利。Safari等は右の互換モードをご利用ください。</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap" id="main">
+    <div id="summary" class="tip"></div>
+    <div id="result"></div>
+    <div class="footer" id="footer"></div>
+  </main>
+
+<script>
+// ====== ユーティリティ ======
+const fmtDate = (ts) => {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  return { date:`${y}-${m}-${day}`, full:`${y}-${m}-${day} ${hh}:${mm}:${ss}` };
+};
+const fmtSize = (n) => {
+  if (n == null || isNaN(n)) return '';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.min(units.length-1, Math.floor(Math.log(n)/Math.log(1024)));
+  return `${(n/Math.pow(1024,i)).toFixed(i?1:0)} ${units[i]}`;
+};
+const escapeHTML = (s) => s.replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+
+// ====== 互換モード（<input webkitdirectory>） ======
+const folderInput = document.getElementById('folderInput');
+folderInput.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  // FileList には subfolder を含む。webkitRelativePath を残す
+  const items = files.map(f => ({
+    file: f,
+    path: f.webkitRelativePath || f.name,
+    name: f.name,
+    lastModified: f.lastModified,
+    size: f.size
+  }));
+  await renderList(items);
+});
+
+// ====== File System Access API 経由 ======
+const pickDirBtn = document.getElementById('pickDir');
+
+pickDirBtn.addEventListener('click', async () => {
+  if (!window.showDirectoryPicker) {
+    alert('このブラウザは File System Access API に未対応です。右の「互換モード」をご利用ください。');
+    return;
+  }
+  try {
+    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    const items = [];
+    await traverseDirectory(dirHandle, '', items);
+    await renderList(items);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return; // ユーザーキャンセル
+    console.error(err);
+    alert('フォルダの読み取りに失敗しました。権限やブラウザ設定をご確認ください。');
+  }
+});
+
+async function traverseDirectory(dirHandle, prefix, items) {
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (handle.kind === 'file') {
+      const file = await handle.getFile();
+      items.push({
+        file,
+        path: prefix ? `${prefix}/${name}` : name,
+        name,
+        lastModified: file.lastModified,
+        size: file.size
+      });
+    } else if (handle.kind === 'directory') {
+      await traverseDirectory(handle, prefix ? `${prefix}/${name}` : name, items);
+    }
+  }
+}
+
+// ====== レンダリング ======
+async function renderList(items) {
+  if (!items || !items.length) return;
+  // 更新日（lastModified）降順でソート
+  items.sort((a,b) => b.lastModified - a.lastModified);
+
+  const total = items.length;
+  const totalSize = items.reduce((s,x)=>s + (x.size||0), 0);
+  document.getElementById('summary').textContent = `読み込み: ${total} 件, 合計サイズ: ${fmtSize(totalSize)}`;
+
+  const container = document.getElementById('result');
+  container.innerHTML = '';
+
+  let currentDateKey = '';
+  for (const it of items) {
+    const { date, full } = fmtDate(it.lastModified);
+    if (date !== currentDateKey) {
+      currentDateKey = date;
+      const h = document.createElement('div');
+      h.className = 'date-head';
+      h.textContent = date; // 日付見出し
+      container.appendChild(h);
+    }
+    const row = document.createElement('div');
+    row.className = 'file';
+
+    const left = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.innerHTML = `${escapeHTML(it.path)} <span class="badge">${fmtSize(it.size)}</span>`;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = `更新: ${full}`;
+    left.appendChild(name);
+    left.appendChild(meta);
+
+    const right = document.createElement('div');
+    right.className = 'btns';
+    const openBtn = document.createElement('button');
+    openBtn.textContent = 'テキストで開く';
+    openBtn.title = '新規タブでプレーンテキスト表示';
+    openBtn.addEventListener('click', () => openAsPlainText(it.file, it.path));
+    right.appendChild(openBtn);
+
+    row.appendChild(left);
+    row.appendChild(right);
+
+    container.appendChild(row);
+  }
+
+  document.getElementById('footer').textContent = '※ バイナリや巨大ファイルは正しく表示できない場合があります。テキストのみ想定。';
+}
+
+// ====== プレーンテキスト新規タブ表示 ======
+async function openAsPlainText(file, titlePath) {
+  try {
+    const maxPreviewBytes = 25 * 1024 * 1024; // 25MB まで（タブで直表示）
+    if (file.size > maxPreviewBytes) {
+      const ok = confirm(`このファイルは ${fmtSize(file.size)} あります。表示に時間がかかる可能性があります。続行しますか？`);
+      if (!ok) return;
+    }
+    const text = await file.text();
+
+    const win = window.open('', '_blank');
+    if (!win) {
+      alert('ポップアップがブロックされました。ブラウザの設定を確認してください。');
+      return;
+    }
+
+    // 画面全体にプレーンテキストで表示（HTMLは最低限）。
+    const safe = escapeHTML(text);
+    const doc = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>${escapeHTML(titlePath)} - plain text</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        html,body{height:100%;margin:0;background:#ffffff;color:#111}
+        pre{margin:0;padding:16px;white-space:pre-wrap;word-wrap:break-word;font:14px/1.6 ui-monospace,SFMono-Regular,Consolas,Monaco,Menlo,monospace}
+        header{position:sticky;top:0;background:#fff;border-bottom:1px solid #eee;padding:10px 14px;font:600 14px/1.2 system-ui}
+      </style>
+    </head><body>
+      <header>${escapeHTML(titlePath)}（サイズ: ${fmtSize(file.size)}）</header>
+      <pre>${safe}</pre>
+    </body></html>`;
+    win.document.open();
+    win.document.write(doc);
+    win.document.close();
+  } catch (err) {
+    console.error(err);
+    alert('テキストとして開けませんでした。バイナリファイルの可能性があります。');
+  }
+}
+</script>
+</body>
+</html>
